@@ -1,11 +1,9 @@
 {
-  "appId": "lr.gov.epa.cmudb",
+  "appId": "lr.gov.epa.cmu",
   "appName": "CMU Database",
   "webDir": "dist",
-  "android": { "allowMixedContent": false, "backgroundColor": "#1F4E78" },
+  "android": { "allowMixedContent": false },
   "plugins": {
-    "CapacitorHttp": { "enabled": true },
-    "SplashScreen": { "launchShowDuration": 900, "backgroundColor": "#1F4E78", "showSpinner": false, "androidScaleType": "CENTER_CROP" },
-    "LocalNotifications": { "smallIcon": "ic_stat_cmu", "iconColor": "#1F4E78" }
+    "CapacitorHttp": { "enabled": true }
   }
 }
