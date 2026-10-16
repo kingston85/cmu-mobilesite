@@ -1,11 +1,5 @@
 node_modules/
 dist/
-android/app/build/
-android/build/
-android/.gradle/
-android/local.properties
+android/
 *.jks
-*.keystore
-
-# fixed test-signing key (not secret) so CI test builds update each other
-!android/app/debug.keystore
+.DS_Store
