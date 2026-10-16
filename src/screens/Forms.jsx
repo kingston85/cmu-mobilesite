@@ -1,520 +1,403 @@
-import { useMemo, useState } from 'react';
-import { Header, Card, Field, Combo, Select, Seg } from './ui';
-import { today, money, num, isNum, eq, toKg, kgFmt, similarCompanies, suggestChem, groupClearances, addDays, parts } from '../lib/util';
+// Forms for every register (add + edit), with the desktop forms' checks live: duplicates, quotas, hazard & fee estimate,
+// bill types/services/suggested fees, receipt and balance checks, GPS + photos. Also the step-by-step bill wizard.
+import { useEffect, useMemo, useState } from 'react';
+import { useApp, useNav } from '../lib/store';
+import { Bar, Btn, Card, Icon, IconBtn, Text, Num, DateIn, Select, Picker, PickSheet, Toggle, Seg, Note, Row, Badge, KV, confirm, alertBox, useBusy } from '../components/ui';
+import { blank, toForm, EFF_SETTINGS, TYPES } from '../lib/records';
+import { money, usd, fmtD, num, str, trim, eqi, iso, today, toDate, dupSimilar, stdChem, lineHazard, feeCalc, quotaWarnings, typeFor, feeFor, groupOfType, servicesForType, billLineFor, billStatus, amountInWords, BILL_KINDS, NEW, clrKg, aiUnit, svcFor } from '../lib/logic';
 import { getGps, takePhoto } from '../lib/device';
 
-/* ================================================================ presets: a saved record → the form, for editing */
-export function presetFrom(kind, snap, id) {
-  const t = snap.tables;
-  if (kind === 'companies' || kind === 'company') {
-    const c = t.companies.find(r => r['Company ID'] === id); if (!c) return null;
-    return { form: 'company', preset: { id, name: c['Company Name'], sector: c['Sector / Activity'], location: c['Location'], other: c['Other Names Recorded'], contact: c['Contact Person'], title: c['Contact Title'], phone: c['Phone'], email: c['Email'], remind: c['Send reminders?'] } };
+const upd = (set, k) => v => set(d => ({ ...d, [k]: v }));
+const setLine = (set, key, i, k) => v => set(d => ({ ...d, [key]: d[key].map((l, j) => (j === i ? { ...l, [k]: v } : l)) }));
+const addLine = (set, key, obj) => set(d => ({ ...d, [key]: [...(d[key] || []), obj] }));
+const delLine = (set, key, i) => set(d => ({ ...d, [key]: d[key].filter((_, j) => j !== i) }));
+const effUpd = (set, key, i, k) => v => set(d => ({ ...d, effluent: { ...d.effluent, [key]: d.effluent[key].map((l, j) => (j === i ? { ...l, [k]: v } : l)) } }));
+const effAdd = (set, key, obj) => set(d => ({ ...d, effluent: { ...d.effluent, [key]: [...(d.effluent[key] || []), obj] } }));
+const effDel = (set, key, i) => set(d => ({ ...d, effluent: { ...d.effluent, [key]: d.effluent[key].filter((_, j) => j !== i) } }));
+
+/** a Claude draft (fill_form field names) → this app's form data */
+export function fromAi(form, x = {}, L = {}) {
+  const S = v => (v === undefined || v === null ? '' : String(v)), D = v => { const d = toDate(v); return d ? iso(d) : S(v); };
+  const std = (rec, s) => { if (s && (L.chemicals || []).includes(s)) return s; const m = stdChem(rec || s, L.chemicals || [], 1)[0]; return m && m.score >= 0.75 ? m.name : (L.chemicals || []).includes('Other / Unspecified') ? 'Other / Unspecified' : ''; };
+  switch (form) {
+    case 'company': return { ...blank.company(), name: S(x.name || x.company), sector: S(x.sector), location: S(x.location), other: S(x.other_names) };
+    case 'licence': return { ...blank.licence(), company: S(x.company), category: S(x.category), type: S(x.type), location: S(x.location), applicationDate: D(x.application_date), responseDate: D(x.response_date), refCode: S(x.reference_code),
+      licNo: S(x.licence_no), issued: D(x.date_issued), expiry: D(x.expiry_date), remarks: S(x.remarks),
+      chemicals: (x.chemicals || []).map(c => ({ name: S(c.name), epaReg: S(c.epa_registration_no), type: S(c.type), qty: S(c.quantity), unit: aiUnit(c.unit), consignment: S(c.consignment_ref) })) };
+    case 'clearance': return { ...blank.clearance(), company: S(x.company), date: D(x.date) || iso(today()), ref: S(x.epa_ref), bl: S(x.bl_no), remarks: S(x.remarks), eta: D(x.eta),
+      lines: (x.lines || []).slice(0, 20).map(l => ({ rec: S(l.chemical_as_recorded || l.chemical_standard), std: std(l.chemical_as_recorded, l.chemical_standard), qty: S(l.quantity), unit: aiUnit(l.unit) || 'kg', bl: S(l.bl_no) })) };
+    case 'bill': return { ...blank.bill(), company: S(x.company), date: D(x.date) || iso(today()), type: S(x.bill_type), ref: S(x.bill_ref), contact: S(x.contact_person), title: S(x.contact_title),
+      lines: (x.lines || []).slice(0, 10).map(l => ({ service: S(l.service), details: S(l.details), amount: S(l.amount) })) };
+    case 'payment': return { ...blank.payment(), bill: S(x.bill_no), company: S(x.company), amount: S(x.amount), date: D(x.date) || iso(today()), receipt: S(x.receipt_no), remarks: S(x.remarks), purpose: S(x.purpose) };
+    case 'issue': return { ...blank.issue(), register: S(x.register), record: S(x.record), issue: S(x.issue), action: S(x.action), status: S(x.status) || 'Open' };
+    case 'inspection': return { ...blank.inspection(), company: S(x.company), site: S(x.site), date: D(x.date) || iso(today()), type: S(x.type) || 'Routine inspection', compliance: S(x.compliance), findings: S(x.findings), actions: S(x.actions), followUp: D(x.follow_up) };
+    default: return blank[form] ? blank[form]() : {};
   }
-  if (kind === 'licences' || kind === 'licence') {
-    const l = t.licences.find(r => r['Record ID'] === id); if (!l) return null;
-    return { form: 'licence', preset: { id, ...licencePreset(snap, l) } };
-  }
-  if (kind === 'clearances' || kind === 'clearance') {
-    const g = groupClearances(t.clearances.filter(r => r['Clearance No.'] === id))[0]; if (!g) return null;
-    return { form: 'clearance', preset: { id, company: g.co, date: g.date, eta: g.eta, ref: g.ref, bl: g.bl, remarks: g.remarks, billNo: g.billNo,
-      lines: g.lines.map(l => ({ rec: l['Chemical as Recorded'], std: l['Chemical (Standard)'], qty: l['Qty as Recorded'], unit: l['Unit'], bl: l['B/L / Invoice / AWB No.'] === g.bl ? '' : l['B/L / Invoice / AWB No.'] })) } };
-  }
-  if (kind === 'bills' || kind === 'bill') {
-    const b = snap.insights.bills.find(x => x.no === id), ls = t.bills.filter(r => r['Bill No.'] === id); if (!b) return null;
-    return { form: 'bill', preset: { id, company: b.co, date: b.date, type: b.type, ref: b.ref, contact: b.contact, title: b.title, location: b.location, activity: (ls[0] || {})['Activity'], linked: b.linked,
-      lines: ls.map(l => ({ service: l['Purpose / Licence Billed'], details: l['Chemical'], amount: l['Amount Billed (USD)'] })) } };
-  }
-  if (kind === 'payments' || kind === 'payment') {
-    const p = t.payments.find(r => r['Record ID'] === id); if (!p) return null;
-    return { form: 'payment', preset: { id, bill: p['Bill No.'], company: p['Company Name'], amount: p['Amount (USD)'], date: p['Payment Date'], receipt: p['Receipt No.'], purpose: p['Purpose / Services'], group: p['Record Group'], remarks: p['Remarks'] } };
-  }
-  if (kind === 'issues' || kind === 'issue') {
-    const i = t.issues.find(r => r['Issue #'] === id); if (!i) return null;
-    return { form: 'issue', preset: { id, register: i['Register'], record: i['Record'], source: i['Source'], issue: i['Issue Found'], action: i['Action Taken'], status: i['Follow-up Status'] } };
-  }
-  if (kind === 'inspections' || kind === 'inspection') {
-    const i = t.inspections.find(r => r['Inspection ID'] === id); if (!i) return null;
-    return { form: 'inspection', preset: { id, company: i['Company'], site: i['Site / Facility'], date: i['Inspection Date'], type: i['Inspection Type'], linked: i['Linked Record'], compliance: i['Compliance'], findings: i['Findings'],
-      actions: i['Actions Required'], followUp: i['Follow-up Date'], lat: i['Latitude'], lng: i['Longitude'], acc: i['GPS Accuracy (m)'], inspector: i['Inspector'] } };
-  }
-  if (kind === 'correspondence') {
-    const c = t.correspondence.find(r => r['Record ID'] === id); if (!c) return null;
-    return { form: 'correspondence', preset: { id, company: c['Company Name'] || c['Name as Recorded'], type: c['Type'], activity: c['Activity'], description: c['Description'], ref: c['EPA Reference No.'], date: c['Date'] } };
-  }
-  return null;
-}
-export function licencePreset(snap, l) {
-  const t = snap.tables, id = l['Record ID'], eff = t.licenceEffluent.filter(e => e['Licence Record ID'] === id), set = k => (eff.find(e => e['Section'] === 'Setting' && eq(e['Field 1'], k)) || {})['Field 2'] || '';
-  return { company: l['Company Name'], category: l['Licence Category'], type: l['Licence / Certificate Type'], location: l['Location'], appDate: l['Application Date'], respDate: l['Response Date'], ref: l['Reference Code'],
-    no: l['Licence / Certificate No.'], issued: l['Date Issued'], expiry: l['Expiry Date'], remarks: l['Remarks'], billNo: l['Bill No.'], asRecorded: l['Name as Recorded'],
-    chems: t.licenceChemicals.filter(c => c['Licence Record ID'] === id).map(c => ({ name: c['Trade or IUPAC Name'], reg: c['EPA Registration No.'], type: c['Type'], qty: c['Stipulated Qty'], unit: c['Unit'], cons: c['Consignment Ref. (BL/IPD No.)'] })),
-    vehicles: t.licenceVehicles.filter(v => v['Licence Record ID'] === id).map(v => ({ type: v['Vehicle Type'], reg: v['Vehicle Registration No.'], epa: v['EPA Registration No.'] })),
-    eff: { water: set('Receiving water'), volume: set('Max. volume (m³/day)'), point: set('Discharge point'),
-      limits: eff.filter(e => e['Section'] === 'Limit').map(e => ({ param: e['Field 1'], unit: e['Field 2'], limit: e['Field 3'], sample: e['Field 4'], schedule: e['Field 5'], stage: e['Field 6'] })),
-      coords: eff.filter(e => e['Section'] === 'Coordinate').map(e => ({ table: e['Field 1'], vertex: e['Field 2'], e: e['Field 3'], n: e['Field 4'] })),
-      sources: eff.filter(e => e['Section'] === 'Source').map(e => ({ source: e['Field 1'], unit: e['Field 2'], x: e['Field 3'], y: e['Field 4'] })) } };
-}
-/** renew: same licence, next year, no number yet */
-export function renewPreset(snap, l) {
-  const p = licencePreset(snap, l), y = (parts(l['Expiry Date']) || parts(today())).y + 1;
-  return { ...p, no: '', ref: '', billNo: '', appDate: today(), respDate: '', issued: `${y}-01-01`, expiry: `${y}-12-31`, remarks: `Renewal of ${l['Record ID']}${l['Licence / Certificate No.'] ? ' (' + l['Licence / Certificate No.'] + ')' : ''}`,
-    chems: p.chems.map(c => ({ ...c, cons: '' })) };
-}
-/** what Claude read / filled → the app's form fields */
-export function fromAi(form, d = {}) {
-  if (form === 'company') return { name: d.name || d.company || '', sector: d.sector || '', location: d.location || '', other: d.other_names || '', contact: d.contact_person || '', title: d.contact_title || '', phone: d.phone || '', email: d.email || '' };
-  if (form === 'licence') return { company: d.company || '', category: d.category || '', type: d.type || '', location: d.location || '', appDate: d.application_date || '', respDate: d.response_date || '', ref: d.reference_code || '',
-    no: d.licence_no || '', issued: d.date_issued || '', expiry: d.expiry_date || '', remarks: d.remarks || '',
-    chems: (d.chemicals || []).map(c => ({ name: c.name || '', reg: c.epa_registration_no || '', type: c.type || '', qty: c.quantity ?? '', unit: c.unit || '', cons: c.consignment_ref || '' })) };
-  if (form === 'clearance') return { company: d.company || '', date: d.date || '', ref: d.epa_ref || '', bl: d.bl_no || '', remarks: d.remarks || '', eta: d.eta || '',
-    lines: (d.lines || []).map(l => ({ rec: l.chemical_as_recorded || l.chemical_standard || '', std: l.chemical_standard || '', qty: l.quantity ?? '', unit: l.unit || '', bl: l.bl_no || '' })) };
-  if (form === 'bill') return { company: d.company || '', date: d.date || '', type: d.bill_type || '', ref: d.bill_ref || '', contact: d.contact_person || '', title: d.contact_title || '', lines: (d.lines || []).map(l => ({ service: l.service || '', details: l.details || '', amount: l.amount ?? '' })) };
-  if (form === 'payment') return { bill: d.bill_no || '', company: d.company || '', amount: d.amount ?? '', date: d.date || '', receipt: d.receipt_no || '', purpose: d.purpose || '', remarks: d.remarks || '' };
-  if (form === 'issue') return { register: d.register || '', record: d.record || '', issue: d.issue || '', action: d.action || '' };
-  return d;
 }
 
-/* ================================================================ shared */
-function useForm(init) {
-  const [v, setV] = useState(init);
-  const [err, setErr] = useState({});
-  const [busy, setBusy] = useState(false);
-  const set = (k, x) => setV(o => ({ ...o, [k]: x }));
-  return { v, set, setV, err, setErr, busy, setBusy };
-}
-function Bar({ title, back, onSave, busy, sub }) {
-  return <Header title={title} sub={sub} back={back} right={<button className="ghost small strong" disabled={busy} onClick={onSave}>{busy ? '…' : 'Save'}</button>} />;
-}
-function Done({ busy, onSave, label = 'Save' }) {
-  return <button className="primary wide big" disabled={busy} onClick={onSave}>{busy ? 'Saving…' : label}</button>;
-}
-const need = (v, keys) => Object.fromEntries(keys.filter(k => !String(v[k] ?? '').trim()).map(k => [k, 'Required']));
-const Inbox = ({ preset }) => (preset && preset.inboxId ? <p className="infobox">📥 Filled from a document read by Claude{preset.aiConf ? ` (confidence ${Math.round(preset.aiConf * 100)}%)` : ''}. Check every value against the document before saving.{preset.aiIssues && preset.aiIssues.length ? <><br /><b>Claude noted:</b> {preset.aiIssues.join(' • ')}</> : null}</p>
-  : preset && preset.fromClaude ? <p className="infobox">✨ Filled by Claude – nothing is saved until you check it and tap Save.</p> : null);
-const coNames = snap => snap.tables.companies.map(c => c['Company Name']);
-const coFix = (snap, name) => coNames(snap).find(n => eq(n, name)) || name;
-/** a list of lines with add / remove */
-function Lines({ title, items, setItems, blank, max, render, addLabel }) {
-  const upd = (i, k, x) => { const patch = typeof k === 'object' ? k : { [k]: x }; setItems(items.map((l, j) => (j === i ? { ...l, ...patch } : l))); };
-  return (<>
-    {items.map((l, i) => (
-      <div className="line" key={i}>
-        <div className="linehead"><b>{title} {i + 1}</b>{items.length > 1 && <button type="button" className="ghost small" onClick={() => setItems(items.filter((_, j) => j !== i))}>Remove</button>}</div>
-        {render(l, (k, x) => upd(i, k, x), i)}
-      </div>))}
-    {items.length < max && <button type="button" className="wide" onClick={() => setItems([...items, blank()])}>{addLabel || `+ Add ${title.toLowerCase()}`}</button>}
-  </>);
-}
-
-/* ================================================================ Company */
-export function CompanyForm({ snap, submit, back, preset = {} }) {
-  const F = useForm({ name: '', sector: '', location: '', other: '', contact: '', title: '', phone: '', email: '', remind: 'Yes', ...preset });
-  const edit = !!preset.id;
-  const exact = snap.tables.companies.find(c => eq(c['Company Name'], F.v.name) && c['Company ID'] !== preset.id);
-  const similar = !edit && F.v.name.trim().length >= 4 && !exact ? similarCompanies(snap.tables.companies, F.v.name) : [];
-  const save = async () => {
-    const e = need(F.v, ['name']); if (exact) e.name = 'Already registered as ' + exact['Company ID'];
-    F.setErr(e); if (Object.keys(e).length) return;
-    F.setBusy(true); const ok = await submit('company', F.v); F.setBusy(false); if (ok) back();
-  };
-  return (<>
-    <Bar title={edit ? `Edit ${preset.id}` : 'Register company'} back={back} onSave={save} busy={F.busy} />
-    <Inbox preset={preset} />
-    <div className="card form">
-      <Field label="Company name" req err={F.err.name}><input value={F.v.name} onChange={e => F.set('name', e.target.value)} /></Field>
-      {similar.length > 0 && <p className="warnbox">Similar names already registered: {similar.map(s => `${s.name} (${s.id})`).join(', ')}. Check it is not the same company.</p>}
-      <Field label="Sector / activity"><Combo id="sec" value={F.v.sector} onChange={x => F.set('sector', x)} options={snap.lists.sectors} /></Field>
-      <Field label="Location"><input value={F.v.location} onChange={e => F.set('location', e.target.value)} /></Field>
-      <Field label="Other names recorded" hint="Abbreviations or other spellings, separated by ;"><input value={F.v.other} onChange={e => F.set('other', e.target.value)} /></Field>
-    </div>
-    <h2 className="sect">Contact & reminders</h2>
-    <div className="card form">
-      <div className="two">
-        <Field label="Contact person"><input value={F.v.contact} onChange={e => F.set('contact', e.target.value)} placeholder="e.g. Mr. Isaac Bestman" /></Field>
-        <Field label="Position / title"><input value={F.v.title} onChange={e => F.set('title', e.target.value)} placeholder="e.g. General Manager" /></Field>
-      </div>
-      <Field label="Phone"><input type="tel" value={F.v.phone} onChange={e => F.set('phone', e.target.value)} placeholder="+231 …" /></Field>
-      <Field label="Email" hint="Several: separate with ;"><input type="email" value={F.v.email} onChange={e => F.set('email', e.target.value)} autoCapitalize="off" /></Field>
-      <Field label="Send reminder e-mails?"><Seg value={F.v.remind || 'Yes'} onChange={x => F.set('remind', x)} options={[['Yes', 'Yes'], ['No', 'No']]} /></Field>
-      <Done busy={F.busy} onSave={save} label={edit ? 'Save changes' : 'Register company'} />
-    </div>
-  </>);
-}
-
-/* ================================================================ Licence / certificate */
-const blankChem = () => ({ name: '', reg: '', type: '', qty: '', unit: 'kg', cons: '' });
-const blankLimit = () => ({ param: '', unit: 'mg/L', limit: '', sample: '', schedule: '', stage: '' });
-export function LicenceForm({ snap, submit, back, preset = {}, go }) {
-  const thisY = new Date().getFullYear();
-  const F = useForm({ company: '', category: '', type: '', location: '', appDate: '', respDate: '', ref: '', no: '', issued: `${thisY}-01-01`, expiry: `${thisY}-12-31`, remarks: '', billNo: '',
-    ...preset, chems: preset.chems && preset.chems.length ? preset.chems : [], vehicles: preset.vehicles || [],
-    eff: { water: '', volume: '', point: '', limits: [], coords: [], sources: [], ...(preset.eff || {}) } });
-  const edit = !!preset.id, c = `${F.v.category} ${F.v.type}`;
-  const isCil = /importation|CIL/i.test(c), isChem = isCil || /registration|CRL/i.test(c), isEdl = /effluent|EDL|dewatering|pond/i.test(c), isRp = /pond/i.test(c), isTr = /transport/i.test(c);
-  const setEff = (k, x) => F.setV(o => ({ ...o, eff: { ...o.eff, [k]: x } }));
-  const co = snap.tables.companies.find(r => eq(r['Company Name'], F.v.company));
-  const save = async () => {
-    const e = need(F.v, ['company', 'category', 'type']);
-    if (F.v.company && !co) e.company = 'Not registered – register the company first';
-    F.setErr(e); if (Object.keys(e).length) return window.scrollTo(0, 0);
-    F.setBusy(true);
-    const d = { ...F.v, company: coFix(snap, F.v.company), chems: F.v.chems.filter(x => x.name.trim()), vehicles: F.v.vehicles.filter(x => x.type || x.reg) };
-    const ok = await submit('licence', d); F.setBusy(false); if (ok) back();
-  };
-  return (<>
-    <Bar title={edit ? `Edit ${preset.id}` : 'Licence / certificate'} sub="CRL · CIL · EDL · permits" back={back} onSave={save} busy={F.busy} />
-    <Inbox preset={preset} />
-    <div className="card form">
-      <Field label="Company" req err={F.err.company}><Combo id="lco" value={F.v.company} onChange={x => { F.set('company', x); const r = snap.tables.companies.find(q => eq(q['Company Name'], x)); if (r && !F.v.location) F.set('location', r['Location'] || ''); }} options={coNames(snap)} /></Field>
-      <div className="two">
-        <Field label="Licence category" req err={F.err.category}><Select value={F.v.category} onChange={x => F.set('category', x)} options={snap.lists.categories} /></Field>
-        <Field label="Licence / certificate type" req err={F.err.type}><Select value={F.v.type} onChange={x => F.set('type', x)} options={snap.lists.types} /></Field>
-      </div>
-      <Field label="Location" hint="Site address"><input value={F.v.location} onChange={e => F.set('location', e.target.value)} /></Field>
-      <div className="two">
-        <Field label="Application date"><input type="date" value={F.v.appDate} onChange={e => F.set('appDate', e.target.value)} /></Field>
-        <Field label="Response date"><input type="date" value={F.v.respDate} onChange={e => F.set('respDate', e.target.value)} /></Field>
-      </div>
-      <Field label="Reference code" hint="e.g. ED/EPA-01/075/26/RL"><input value={F.v.ref} onChange={e => F.set('ref', e.target.value)} /></Field>
-      <Field label="Licence / certificate No." hint="Leave blank if not yet issued (status = Pending)"><input value={F.v.no} onChange={e => F.set('no', e.target.value)} /></Field>
-      <div className="two">
-        <Field label="Date issued"><input type="date" value={F.v.issued} onChange={e => F.set('issued', e.target.value)} /></Field>
-        <Field label="Expiry date"><input type="date" value={F.v.expiry} onChange={e => F.set('expiry', e.target.value)} /></Field>
-      </div>
-      {F.v.issued && F.v.expiry && F.v.expiry < F.v.issued && <p className="warnbox">The expiry date is before the issue date.</p>}
-      <Field label="Remarks"><textarea rows={2} value={F.v.remarks} onChange={e => F.set('remarks', e.target.value)} /></Field>
-    </div>
-    {(isChem || F.v.chems.length > 0) && <><h2 className="sect">Chemicals on this licence ({F.v.chems.length})</h2>
-      <div className="card form">
-        <p className="muted small">{isCil ? 'CIL: name, EPA registration No., stipulated quantity, unit and consignment ref. – used for the import quota check.' : 'CRL: name, EPA registration No. and type.'}</p>
-        <Lines title="Chemical" items={F.v.chems} setItems={x => F.set('chems', x)} blank={blankChem} max={50} render={(l, u) => (<>
-          <Field label="Trade or IUPAC name"><Combo id="lchem" value={l.name} onChange={x => u('name', x)} options={snap.lists.chemicals} /></Field>
-          <AddChem name={l.name} snap={snap} go={go} />
-          <div className="two"><Field label="EPA registration No."><input value={l.reg} onChange={e => u('reg', e.target.value)} /></Field><Field label="Type"><input value={l.type} onChange={e => u('type', e.target.value)} /></Field></div>
-          {isCil && <div className="two"><Field label="Stipulated qty"><input inputMode="decimal" value={l.qty} onChange={e => u('qty', e.target.value)} /></Field>
-            <Field label="Unit"><Select value={l.unit} onChange={x => u('unit', x)} options={['kg', 'MT', 'L', 'kg/month', 'MT/month', 'pcs', 'Bottles']} blank={null} /></Field></div>}
-          {isCil && <Field label="Consignment ref. (BL/IPD No.)"><input value={l.cons} onChange={e => u('cons', e.target.value)} placeholder="To Be Provided" /></Field>}
-        </>)} />
-        {!F.v.chems.length && <button type="button" className="wide" onClick={() => F.set('chems', [blankChem()])}>+ Add chemical</button>}
-      </div></>}
-    {(isTr || F.v.vehicles.length > 0) && <><h2 className="sect">Vehicles ({F.v.vehicles.length})</h2>
-      <div className="card form">
-        <Lines title="Vehicle" items={F.v.vehicles} setItems={x => F.set('vehicles', x)} blank={() => ({ type: '', reg: '', epa: '' })} max={60} render={(l, u) => (<>
-          <Field label="Vehicle type"><Combo id="vt" value={l.type} onChange={x => u('type', x)} options={snap.lists.vehicleTypes} /></Field>
-          <div className="two"><Field label="Registration No."><input value={l.reg} onChange={e => u('reg', e.target.value.toUpperCase())} /></Field><Field label="EPA registration No."><input value={l.epa} onChange={e => u('epa', e.target.value)} /></Field></div>
-        </>)} />
-        {!F.v.vehicles.length && <button type="button" className="wide" onClick={() => F.set('vehicles', [{ type: '', reg: '', epa: '' }])}>+ Add vehicle</button>}
-      </div></>}
-    {isEdl && <><h2 className="sect">Effluent details (EDL)</h2>
-      <div className="card form">
-        <Field label="Receiving water" hint='Printed in conditions 1–2, e.g. "the estuary"'><input value={F.v.eff.water} onChange={e => setEff('water', e.target.value)} /></Field>
-        <div className="two"><Field label="Max. volume (m³/day)"><input inputMode="decimal" value={F.v.eff.volume} onChange={e => setEff('volume', e.target.value)} /></Field>
-          <Field label="Discharge point / facility"><input value={F.v.eff.point} onChange={e => setEff('point', e.target.value)} placeholder="in a containment tank" /></Field></div>
-        <h4>Discharge limits ({F.v.eff.limits.length})</h4>
-        <Lines title="Limit" items={F.v.eff.limits} setItems={x => setEff('limits', x)} blank={blankLimit} max={20} render={(l, u) => (<>
-          <Field label="Parameter"><Combo id="par" value={l.param} onChange={x => u('param', x)} options={snap.lists.params} /></Field>
-          <div className="two"><Field label="Unit"><Combo id="eu" value={l.unit} onChange={x => u('unit', x)} options={snap.lists.effUnits} /></Field><Field label="Limit"><input value={l.limit} onChange={e => u('limit', e.target.value)} /></Field></div>
-          <div className="two"><Field label="Sample type"><input value={l.sample} onChange={e => u('sample', e.target.value)} placeholder="Grab / Composite" /></Field>
-            <Field label="Testing schedule"><Select value={l.schedule} onChange={x => u('schedule', x)} options={snap.lists.schedules} /></Field></div>
-          {isRp && <Field label="Discharge stage" hint="e.g. Detox Unit I & II to TSF-II – one table per stage"><input value={l.stage} onChange={e => u('stage', e.target.value)} /></Field>}
-        </>)} />
-        {!F.v.eff.limits.length && <button type="button" className="wide" onClick={() => setEff('limits', [blankLimit()])}>+ Add limit</button>}
-        {isRp && <><h4>Geo-reference – Tables 1A / 1B ({F.v.eff.coords.length})</h4>
-          <Lines title="Point" items={F.v.eff.coords} setItems={x => setEff('coords', x)} blank={() => ({ table: '1A', vertex: '', e: '', n: '' })} max={20} render={(l, u) => (<>
-            <div className="two"><Field label="Table"><Select value={l.table} onChange={x => u('table', x)} options={['1A', '1B']} blank={null} /></Field><Field label="Vertex"><input value={l.vertex} onChange={e => u('vertex', e.target.value)} /></Field></div>
-            <div className="two"><Field label="Easting"><input inputMode="decimal" value={l.e} onChange={e => u('e', e.target.value)} /></Field><Field label="Northing"><input inputMode="decimal" value={l.n} onChange={e => u('n', e.target.value)} /></Field></div>
-          </>)} />
-          {!F.v.eff.coords.length && <button type="button" className="wide" onClick={() => setEff('coords', [{ table: '1A', vertex: 'A', e: '', n: '' }])}>+ Add coordinate</button>}
-          <h4>Discharge sources – Table 2 ({F.v.eff.sources.length})</h4>
-          <Lines title="Source" items={F.v.eff.sources} setItems={x => setEff('sources', x)} blank={() => ({ source: '', unit: '', x: '', y: '' })} max={6} render={(l, u) => (<>
-            <div className="two"><Field label="Discharge source"><input value={l.source} onChange={e => u('source', e.target.value)} /></Field><Field label="Receiving unit"><input value={l.unit} onChange={e => u('unit', e.target.value)} /></Field></div>
-            <div className="two"><Field label="X (Table 1B)"><input inputMode="decimal" value={l.x} onChange={e => u('x', e.target.value)} /></Field><Field label="Y (Table 1B)"><input inputMode="decimal" value={l.y} onChange={e => u('y', e.target.value)} /></Field></div>
-          </>)} />
-          {!F.v.eff.sources.length && <button type="button" className="wide" onClick={() => setEff('sources', [{ source: '', unit: '', x: '', y: '' }])}>+ Add source</button>}</>}
-      </div></>}
-    <div className="card form"><Done busy={F.busy} onSave={save} label={edit ? 'Save changes' : 'Save licence'} /></div>
-  </>);
-}
-
-/* ================================================================ Clearance */
-const blankLine = () => ({ rec: '', std: '', qty: '', unit: 'kg', bl: '' });
-export function ClearanceForm({ snap, submit, back, preset = {}, go }) {
-  const F = useForm({ company: '', date: today(), eta: '', ref: '', bl: '', remarks: '', ...preset, lines: preset.lines && preset.lines.length ? preset.lines : [blankLine()] });
-  const edit = !!preset.id;
-  const co = snap.tables.companies.find(r => eq(r['Company Name'], F.v.company));
-  const totKg = F.v.lines.reduce((a, l) => a + (toKg(l.qty, l.unit) || 0), 0);
-  // quota hint from the downloaded copy (the server checks again before saving)
-  const q = co ? snap.insights.quotas.filter(x => x.coId === co['Company ID'] && x.active) : [];
-  const save = async () => {
-    const e = need(F.v, ['company', 'date']);
-    if (F.v.company && !co) e.company = 'Not registered – register the company first';
-    if (!F.v.lines.some(l => (l.rec || l.std).trim())) e.lines = 'Add at least one chemical';
-    F.setErr(e); if (Object.keys(e).length) return window.scrollTo(0, 0);
-    F.setBusy(true);
-    const d = { ...F.v, company: co['Company Name'], lines: F.v.lines.filter(l => (l.rec || l.std).trim()).map(l => ({ ...l, rec: l.rec || l.std })) };
-    const ok = await submit('clearance', d); F.setBusy(false); if (ok) back();
-  };
-  return (<>
-    <Bar title={edit ? `Edit ${preset.id}` : 'Chemical clearance'} sub="One clearance, up to 20 chemicals" back={back} onSave={save} busy={F.busy} />
-    <Inbox preset={preset} />
-    <div className="card form">
-      <Field label="Company" req err={F.err.company}><Combo id="cco" value={F.v.company} onChange={x => F.set('company', x)} options={coNames(snap)} /></Field>
-      <div className="two">
-        <Field label="Clearance date" req err={F.err.date}><input type="date" value={F.v.date} onChange={e => F.set('date', e.target.value)} /></Field>
-        <Field label="ETA"><input type="date" value={F.v.eta} onChange={e => F.set('eta', e.target.value)} /></Field>
-      </div>
-      <Field label="EPA clearance ref. No." hint="e.g. ED/EPA-01/0067/26/RL"><input value={F.v.ref} onChange={e => F.set('ref', e.target.value)} /></Field>
-      <Field label="B/L / invoice / AWB No." hint="Used for every line unless a line has its own"><input value={F.v.bl} onChange={e => F.set('bl', e.target.value)} /></Field>
-      <Field label="Remarks"><textarea rows={2} value={F.v.remarks} onChange={e => F.set('remarks', e.target.value)} /></Field>
-    </div>
-    {q.length > 0 && <p className="infobox">Licensed quotas for this company: {q.slice(0, 4).map(x => `${x.chem} ${x.limit === null ? '(no qty)' : Math.round((x.pct || 0) * 100) + '% used'}`).join(' · ')}</p>}
-    <h2 className="sect">Chemicals ({F.v.lines.length}/20){F.err.lines && <span className="err"> – {F.err.lines}</span>}</h2>
-    <div className="card form">
-      <Lines title="Chemical" items={F.v.lines} setItems={x => F.set('lines', x)} blank={blankLine} max={20} render={(l, u) => {
-        const sug = l.rec && !l.std ? suggestChem(snap.lists.chemicals, l.rec, 1)[0] : null;
-        return (<>
-          <Field label="Chemical as recorded" hint="Exactly as on the invoice / B/L"><input value={l.rec} onChange={e => u('rec', e.target.value)} /></Field>
-          <Field label="Chemical (standard)"><Combo id="cstd" value={l.std} onChange={x => u('std', x)} options={snap.lists.chemicals} /></Field>
-          <AddChem name={l.std} snap={snap} go={go} />
-          {sug && sug.score >= 0.5 && <button type="button" className="link left" onClick={() => u('std', sug.name)}>Use “{sug.name}”?</button>}
-          <div className="two"><Field label="Quantity"><input inputMode="decimal" value={l.qty} onChange={e => u('qty', e.target.value)} /></Field>
-            <Field label="Unit"><Select value={l.unit} onChange={x => u('unit', x)} options={snap.lists.units.length ? snap.lists.units : ['kg', 'MT', 'L', 'pcs']} blank={null} /></Field></div>
-          <Field label="B/L for this line (if different)"><input value={l.bl} onChange={e => u('bl', e.target.value)} /></Field>
-        </>);
-      }} />
-      <div className="kv"><span>Total</span><b>{kgFmt(totKg)} kg · {kgFmt(totKg / 1000)} MT</b></div>
-      {go && <button type="button" className="wide" onClick={() => go('fee', { lines: F.v.lines.filter(l => l.std).map(l => ({ std: l.std, qty: l.qty, unit: l.unit, hmis: '', cat: '' })) })}>💲 Fee estimate for these chemicals</button>}
-      <Done busy={F.busy} onSave={save} label={edit ? 'Save changes' : 'Save clearance'} />
-    </div>
-  </>);
-}
-
-/* ================================================================ Bill (multi-service) */
-const blankSvc = () => ({ service: '', details: '', amount: '' });
-export function BillForm({ snap, submit, back, preset = {} }) {
-  const F = useForm({ company: '', date: today(), type: '', ref: '', contact: '', title: '', location: '', activity: '', linked: '', ...preset, lines: preset.lines && preset.lines.length ? preset.lines : [blankSvc()] });
-  const edit = !!preset.id, fees = snap.config.fees || [], bts = snap.config.billTypes || [];
-  const bt = bts.find(b => eq(b['Bill Type'], F.v.type));
-  const group = bt ? bt['Bill Group'] : '';
-  const services = fees.filter(f => !group || group === 'Other' || eq(f['Bill Group'], group) || eq(f['Bill Group'], 'Other')).map(f => f['Service']);
-  const fee = s => fees.find(f => eq(f['Service'], s));
-  const co = snap.tables.companies.find(r => eq(r['Company Name'], F.v.company));
-  const total = F.v.lines.reduce((a, l) => a + num(l.amount), 0);
-  const pickCo = x => {
-    const r = snap.tables.companies.find(q => eq(q['Company Name'], x));
-    F.setV(o => ({ ...o, company: x, ...(r && !edit ? { contact: o.contact || r['Contact Person'] || '', title: o.title || r['Contact Title'] || '', location: o.location || r['Location'] || '', activity: o.activity || r['Sector / Activity'] || '' } : {}) }));
-  };
-  const save = async () => {
-    const e = need(F.v, ['company', 'date', 'type']);
-    if (F.v.company && !co) e.company = 'Not registered – register the company first';
-    const ls = F.v.lines.filter(l => l.service.trim());
-    if (!ls.length) e.lines = 'Add at least one service'; else if (ls.some(l => !(num(l.amount) > 0))) e.lines = 'Every service needs an amount';
-    F.setErr(e); if (Object.keys(e).length) return window.scrollTo(0, 0);
-    F.setBusy(true); const ok = await submit('bill', { ...F.v, company: co['Company Name'], lines: ls }); F.setBusy(false); if (ok) back();
-  };
-  return (<>
-    <Bar title={edit ? `Edit ${preset.id}` : 'New bill'} sub="One Bill No., up to 10 services" back={back} onSave={save} busy={F.busy} />
-    <Inbox preset={preset} />
-    <div className="card form">
-      <Field label="Company" req err={F.err.company}><Combo id="bco" value={F.v.company} onChange={pickCo} options={coNames(snap)} /></Field>
-      <div className="two">
-        <Field label="Bill date" req err={F.err.date}><input type="date" value={F.v.date} onChange={e => F.set('date', e.target.value)} /></Field>
-        <Field label="Bill type" req err={F.err.type}><Select value={F.v.type} onChange={x => F.set('type', x)} options={bts.map(b => b['Bill Type'])} /></Field>
-      </div>
-      {bt && <p className="muted small">Letter wording: “{String(bt['Opening Paragraph']).slice(0, 110)}…”</p>}
-      <Field label="Bill ref. No." hint="EPA letter reference, e.g. ED/EPA-01/03336/26/RL"><input value={F.v.ref} onChange={e => F.set('ref', e.target.value)} /></Field>
-      <div className="two">
-        <Field label="Contact person" hint="As it should appear on the letter"><input value={F.v.contact} onChange={e => F.set('contact', e.target.value)} /></Field>
-        <Field label="Position / title" hint="or Mr./Mrs./Dr."><input value={F.v.title} onChange={e => F.set('title', e.target.value)} /></Field>
-      </div>
-      <div className="two">
-        <Field label="Location"><input value={F.v.location} onChange={e => F.set('location', e.target.value)} /></Field>
-        <Field label="Activity"><input value={F.v.activity} onChange={e => F.set('activity', e.target.value)} /></Field>
-      </div>
-      <Field label="Linked record(s)" hint="LIC-### / CLN-### this bill is for"><input value={F.v.linked} onChange={e => F.set('linked', e.target.value.toUpperCase())} /></Field>
-    </div>
-    <h2 className="sect">Services ({F.v.lines.length}/10){F.err.lines && <span className="err"> – {F.err.lines}</span>}</h2>
-    <div className="card form">
-      <Lines title="Service" items={F.v.lines} setItems={x => F.set('lines', x)} blank={blankSvc} max={10} render={(l, u) => {
-        const f = fee(l.service);
-        return (<>
-          <Field label="Service"><Select value={l.service} onChange={x => { const s = fee(x); u(s && isNum(s['Suggested Fee (USD)']) && !l.amount ? { service: x, amount: s['Suggested Fee (USD)'] } : { service: x }); }} options={services.length ? services : snap.lists.purposes} /></Field>
-          <Field label="Details / chemical(s)"><input value={l.details} onChange={e => u('details', e.target.value)} /></Field>
-          <Field label="Amount (US$)" hint={f ? (isNum(f['Suggested Fee (USD)']) ? `Suggested fee US$${money(f['Suggested Fee (USD)'])}` : f['Notes'] || '') : ''}><input inputMode="decimal" value={l.amount} onChange={e => u('amount', e.target.value)} /></Field>
-        </>);
-      }} />
-      <div className="kv"><span>Total</span><b className="big">US${money(total)}</b></div>
-      <Done busy={F.busy} onSave={save} label={edit ? 'Save changes' : 'Save bill'} />
-    </div>
-  </>);
-}
-
-/* ================================================================ Payment */
-export function PaymentForm({ snap, submit, back, preset = {} }) {
-  const F = useForm({ bill: '', company: '', amount: '', date: today(), receipt: '', purpose: '', group: 'Mobile app', remarks: '', ...preset });
-  const edit = !!preset.id;
-  const [mode, setMode] = useState(preset.bill || !preset.company ? 'bill' : 'account');
-  const bills = useMemo(() => [...snap.insights.bills].sort((a, b) => Number(a.isPaid) - Number(b.isPaid) || String(b.date).localeCompare(String(a.date))), [snap]);
-  const b = bills.find(x => eq(x.no, F.v.bill));
-  const ownAmt = edit ? num(preset.amount) : 0, outstanding = b ? b.out + (b.no === preset.bill ? ownAmt : 0) : 0;
-  const dupRcpt = F.v.receipt && snap.tables.payments.find(p => eq(p['Receipt No.'], F.v.receipt) && p['Record ID'] !== preset.id);
-  const save = async () => {
-    const e = need(F.v, ['amount', 'date']);
-    if (mode === 'bill' && !b) e.bill = 'Choose the bill';
-    if (mode === 'account' && !snap.tables.companies.some(c => eq(c['Company Name'], F.v.company))) e.company = 'Choose a registered company';
-    if (!(num(F.v.amount) > 0)) e.amount = 'Must be above 0';
-    F.setErr(e); if (Object.keys(e).length) return;
-    F.setBusy(true); const ok = await submit('payment', { ...F.v, bill: mode === 'bill' ? b.no : '', company: mode === 'bill' ? b.co : coFix(snap, F.v.company) }); F.setBusy(false); if (ok) back();
-  };
-  return (<>
-    <Bar title={edit ? `Edit ${preset.id}` : 'Record payment'} back={back} onSave={save} busy={F.busy} />
-    <Inbox preset={preset} />
-    <div className="card form">
-      <Seg value={mode} onChange={setMode} options={[['bill', 'Against a bill'], ['account', 'Company account']]} />
-      <div className="mt" />
-      {mode === 'bill' ? <Field label="Bill" req err={F.err.bill}>
-        <Combo id="bills" value={F.v.bill} onChange={x => F.set('bill', x.split(' ')[0])} options={bills.map(x => `${x.no} · ${x.co} · ${x.isPaid ? 'paid' : 'owes US$' + money(x.out)}`)} placeholder="Type the Bill No. or company" />
-      </Field> : <Field label="Company" req err={F.err.company} hint="A payment not linked to a bill: it is applied to the company's oldest bills"><Combo id="pco" value={F.v.company} onChange={x => F.set('company', x)} options={coNames(snap)} /></Field>}
-      {mode === 'bill' && b && <p className={b.isPaid && !edit ? 'okbox' : 'infobox'}>{b.co}<br />Billed US${money(b.billed)} · paid US${money(b.paid)} · <b>outstanding US${money(outstanding)}</b>{b.purpose && <><br /><small>{b.purpose}</small></>}</p>}
-      <div className="two">
-        <Field label="Amount (US$)" req err={F.err.amount}><input inputMode="decimal" value={F.v.amount} onChange={e => F.set('amount', e.target.value)} /></Field>
-        <Field label="Payment date" req err={F.err.date}><input type="date" value={F.v.date} onChange={e => F.set('date', e.target.value)} /></Field>
-      </div>
-      {b && !edit && !F.v.amount && outstanding > 0 && <button type="button" className="link left" onClick={() => F.set('amount', String(outstanding))}>Fill the full balance (US${money(outstanding)})</button>}
-      {b && num(F.v.amount) > outstanding + 0.005 && <p className="warnbox">More than the outstanding balance of US${money(outstanding)}.</p>}
-      <Field label="Receipt No."><input value={F.v.receipt} onChange={e => F.set('receipt', e.target.value)} /></Field>
-      {dupRcpt && <p className="warnbox">Receipt {F.v.receipt} is already recorded on {dupRcpt['Record ID']}.</p>}
-      <Field label="Purpose / services" hint="Taken from the bill if empty"><input value={F.v.purpose} onChange={e => F.set('purpose', e.target.value)} /></Field>
-      <Field label="Record group"><Select value={F.v.group} onChange={x => F.set('group', x)} options={snap.lists.groups.length ? snap.lists.groups : ['Mobile app']} blank={null} /></Field>
-      <Field label="Remarks"><textarea rows={2} value={F.v.remarks} onChange={e => F.set('remarks', e.target.value)} /></Field>
-      <Done busy={F.busy} onSave={save} label={edit ? 'Save changes' : 'Save payment'} />
-    </div>
-  </>);
-}
-
-/* ================================================================ Field inspection (GPS + photos) */
-export function InspectionForm({ snap, submit, back, flash, preset = {}, session }) {
-  const F = useForm({ company: '', site: '', date: today(), type: '', linked: '', compliance: '', findings: '', actions: '', followUp: '', lat: '', lng: '', acc: '', inspector: session ? session.user.name : '', ...preset });
-  const edit = !!preset.id;
+/* ------------------------------------------------------------------ the form screen */
+export function FormScreen({ type, op = 'create', id, prefill, fromIds, feeLines, inboxFid, draft }) {
+  const { T, L, precheck, save, toast, canEdit } = useApp(), nav = useNav();
+  const init = useMemo(() => {
+    if (op === 'update') return toForm(type, T, id) || blank[type]();
+    let d = { ...blank[type](), ...(draft ? fromAi(type, draft, L) : {}), ...(prefill || {}) };
+    if (type === 'contact' && id) d = toForm('contact', T, id);
+    if (type === 'hazard' && id) d = toForm('hazard', T, id);
+    if (type === 'bill' && fromIds?.length) {
+      const ls = fromIds.map(x => billLineFor(T, x, L.services)).filter(Boolean);
+      if (ls.length) {
+        d.company = ls[0].company; d.location = d.location || ls[0].location; d.linked = fromIds.join(', ');
+        d.type = d.type || typeFor(ls[0].service, L.services);
+        d.lines = ls.map(l => ({ service: l.service, details: l.details, amount: l.amount === null ? '' : String(l.amount) }));
+        if (feeLines?.total && ls.length === 1 && ls[0].service === 'Chemical Clearance') { d.lines[0].amount = String(feeLines.total); d.lines[0].details += ' – fee per RI/C&E-002-04/20'; }
+        const co = T.companies.find(c => eqi(c['Company Name'], d.company)); if (co && !d.activity) d.activity = co['Sector / Activity'] || '';
+      }
+    }
+    if (type === 'bill' && d.company && !d.contact) { const prev = T.bills.filter(b => eqi(b['Company Name'], d.company) && b['Contact Person']).sort((a, b) => (toDate(b['Bill Date']) || 0) - (toDate(a['Bill Date']) || 0))[0]; if (prev) { d.contact = prev['Contact Person']; d.title = prev['Contact Title']; } }
+    return d;
+  }, []);   // eslint-disable-line
+  const [d, set] = useState(init);
   const [photos, setPhotos] = useState([]);
-  const [gpsBusy, setGpsBusy] = useState(false);
-  const gps = async () => {
-    setGpsBusy(true);
-    try { const g = await getGps(); F.setV(o => ({ ...o, lat: g.lat, lng: g.lng, acc: g.gps_accuracy_m })); flash(`Location captured (±${g.gps_accuracy_m} m)`); }
-    catch (e) { flash('Could not get the location: ' + e.message); }
-    setGpsBusy(false);
-  };
-  const photo = async () => { try { const d = await takePhoto(); if (d) setPhotos(p => [...p, { data: d, taken: new Date().toISOString() }]); } catch (e) { if (!/cancel/i.test(e.message)) flash(e.message); } };
-  const save = async () => {
-    const e = need(F.v, ['site', 'date']); F.setErr(e); if (Object.keys(e).length) return;
-    F.setBusy(true); const ok = await submit('inspection', { ...F.v, company: coFix(snap, F.v.company) }, photos); F.setBusy(false); if (ok) back();
-  };
+  const [busy, run] = useBusy();
+  const dirty = JSON.stringify(d) !== JSON.stringify(init) || photos.length;
+  const leave = async () => { if (!dirty || await confirm({ title: 'Discard changes?', message: 'What you typed on this form will be lost.', ok: 'Discard', danger: true })) nav.back(); };
+  const submit = () => run(async () => {
+    const recId = type === 'contact' ? d.coId : type === 'hazard' ? d.name : id;
+    const c = precheck(type, op, recId, d);
+    if (c.error) { await alertBox({ title: 'Please check', message: c.error }); return; }
+    if (c.warnings?.length && !(await confirm({ title: 'Please check', message: 'Save anyway?', list: c.warnings, ok: 'Save anyway', okKind: 'accent' }))) return;
+    const opx = type === 'contact' || type === 'hazard' ? 'update' : op;
+    const r = await save(type, opx, recId, d, { photos, inboxFid, force: !!c.warnings?.length });
+    toast(op === 'create' ? `${TYPES[type].label} saved${r.tempId ? ' as ' + r.tempId : ''}` : 'Changes saved', 'ok');
+    const view = { company: 'company', licence: 'licence', clearance: 'clearance', bill: 'bill', payment: 'payment', issue: 'issue', inspection: 'inspection', correspondence: 'correspondence' }[type];
+    if (op === 'create' && view && r.tempId) nav.replace(view, { id: r.tempId }); else nav.back();
+  });
+  const Body = { company: CompanyForm, licence: LicenceForm, clearance: ClearanceForm, bill: BillForm, payment: PaymentForm, issue: IssueForm, correspondence: CorrForm, inspection: InspectionForm, contact: ContactForm, hazard: HazardForm }[type];
+  const title = (op === 'create' && !['contact', 'hazard'].includes(type) ? 'New ' : 'Edit ') + TYPES[type].label.toLowerCase();
+  return (
+    <>
+      <Bar title={title} sub={op === 'update' ? id : inboxFid ? 'From the Document Inbox' : draft ? 'Filled by Claude – please check' : TYPES[type].reg} onBack={leave} />
+      <main className="main noNav"><div className="wrap">
+        {!canEdit ? <Note kind="warn">Your account is view-only – changes cannot be saved.</Note> : null}
+        {draft || inboxFid ? <Note icon="sparkle">Filled in from a document. Check every value against the document before saving – nothing is saved until you tap Save.</Note> : null}
+        <Body d={d} set={set} op={op} id={id} photos={photos} setPhotos={setPhotos} />
+      </div></main>
+      <div className="stickybar"><Btn kind="ghost" onClick={leave}>Cancel</Btn><Btn kind="accent" icon="check" disabled={busy || !canEdit} onClick={submit}>{busy ? 'Saving…' : op === 'create' && !['contact', 'hazard'].includes(type) ? 'Save new' : 'Save'}</Btn></div>
+    </>
+  );
+}
+
+const companyOpts = T => T.companies.map(c => ({ value: c['Company Name'], label: c['Company Name'], sub: [c['Company ID'], c['Sector / Activity']].filter(Boolean).join(' · '), keys: c['Other Names Recorded'] + ' ' + c['Company ID'] }));
+function CompanyPick({ value, onChange, req = true, free = false, label = 'Company' }) {
+  const { T } = useApp(), nav = useNav();
+  const known = !value || T.companies.some(c => eqi(c['Company Name'], value));
+  return <Picker label={label} req={req} value={value} onChange={onChange} options={companyOpts(T)} free={free} title="Choose a company"
+    warn={!known && !free ? 'Not a registered company – register it first.' : !known && free ? 'Not registered – it will be saved with the name only.' : ''} hint={!value ? <span>Not in the list? <a onClick={() => nav.go('form', { type: 'company', op: 'create' })}>Register a company</a></span> : null} />;
+}
+function LineHead({ n, onDel, children }) { return <div className="ln"><span className="grow">{children || 'Line ' + n}</span>{onDel ? <button className="ib" style={{ width: 30, height: 30 }} onClick={onDel} aria-label="Remove line"><Icon n="trash" s={16} /></button> : null}</div>; }
+
+/* ------------------------------------------------------------------ company */
+function CompanyForm({ d, set, id }) {
+  const { T, L } = useApp(), nav = useNav();
+  const sim = useMemo(() => (trim(d.name).length >= 3 ? dupSimilar(T.companies, d.name, 4, id) : []), [d.name, T.companies, id]);
+  const exact = T.companies.find(c => eqi(c['Company Name'], d.name) && c['Company ID'] !== id);
+  return (
+    <>
+      <Text label="Company name" req value={d.name} onChange={upd(set, 'name')} err={exact ? `Already registered as ${exact['Company ID']}` : ''} hint="The official name, as on the registration documents." />
+      {sim.length && !exact ? <Note kind="warn"><b>Possible duplicate</b> – similar companies are already registered:<ul>{sim.map(s => <li key={s.id}><a onClick={() => nav.go('company', { id: s.id })}>{s.id} {s.name}</a> ({Math.round(s.score * 100)}%)</li>)}</ul></Note> : null}
+      <Picker label="Sector / activity" value={d.sector} onChange={upd(set, 'sector')} options={L.sectors} free />
+      <Text label="Location" value={d.location} onChange={upd(set, 'location')} hint="Street / town, county" />
+      <Text label="Other names recorded" area value={d.other} onChange={upd(set, 'other')} hint="Other spellings used on documents, separated by ;" />
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ licence */
+const defaultType = (cat, types) => { const m = { 'Chemical Registration (CRL)': 'Chemical Registration', 'Chemical Importation (CIL)': 'Chemical Importation', 'Effluent Discharge (EDL)': 'Effluent Discharge', 'Chemical Transportation': 'Annual Chemical Transportation License', 'Fumigation': 'Fumigation Certificate' }[cat]; return types.includes(m) ? m : ''; };
+function LicenceForm({ d, set, id }) {
+  const { T, L } = useApp();
+  const dupNo = trim(d.licNo) ? T.licences.filter(l => eqi(l['Licence / Certificate No.'], d.licNo) && l['Record ID'] !== id) : [];
+  const iss = toDate(d.issued), exp = toDate(d.expiry);
+  const isChem = /\(CRL\)|\(CIL\)/i.test(d.category), isCil = /\(CIL\)/i.test(d.category), isEdl = /EDL|Effluent|Dewater/i.test(d.category + ' ' + d.type), isRp = /Retention|Dewater/i.test(d.type), isTr = /Transport/i.test(d.category);
+  const [sec, setSec] = useState('main');
+  const units = [...new Set([...L.units, 'kg/month', 'MT/month', 'L/month', 'cylinders'])];
+  return (
+    <>
+      <Seg value={sec} onChange={setSec} options={[{ value: 'main', label: 'Details' }, { value: 'chem', label: `Chemicals ${d.chemicals.filter(c => trim(c.name)).length || ''}` }, ...(isTr || d.vehicles.length ? [{ value: 'veh', label: `Vehicles ${d.vehicles.length || ''}` }] : []), ...(isEdl ? [{ value: 'eff', label: 'Effluent' }] : [])]} />
+      {sec === 'main' ? <>
+        <CompanyPick value={d.company} onChange={v => { const co = T.companies.find(c => c['Company Name'] === v); set(x => ({ ...x, company: v, location: x.location || (co ? co['Location'] : '') })); }} />
+        <Select label="Licence category" req value={d.category} onChange={v => set(x => ({ ...x, category: v, type: x.type || defaultType(v, L.types) }))} options={L.categories} />
+        <Select label="Licence / certificate type" req value={d.type} onChange={upd(set, 'type')} options={L.types} />
+        <Text label="Location" value={d.location} onChange={upd(set, 'location')} hint="Site address" />
+        <div className="grid2"><DateIn label="Application date" value={d.applicationDate} onChange={upd(set, 'applicationDate')} /><DateIn label="Response date" value={d.responseDate} onChange={upd(set, 'responseDate')} /></div>
+        <Text label="Reference code" value={d.refCode} onChange={upd(set, 'refCode')} hint="e.g. ED/EPA-01/075/26/RL" />
+        <Text label="Licence / certificate No." value={d.licNo} onChange={upd(set, 'licNo')} warn={dupNo.length ? `Already on ${dupNo.map(l => l['Record ID']).join(', ')}` : ''} hint="Leave blank if not yet issued (status = Pending)" />
+        <div className="grid2"><DateIn label="Date issued" value={d.issued} onChange={v => set(x => ({ ...x, issued: v, expiry: x.expiry || (v ? iso(new Date(new Date(v).getFullYear(), 11, 31)) : '') }))} />
+          <DateIn label="Expiry date" value={d.expiry} onChange={upd(set, 'expiry')} warn={iss && exp && exp < iss ? 'Expiry is before the issue date' : ''} /></div>
+        <Text label="Remarks" area value={d.remarks} onChange={upd(set, 'remarks')} />
+        {isChem && !d.chemicals.length ? <Note>Add the chemicals on this licence under <b>Chemicals</b>{isCil ? ' – with the stipulated quantities, they become the import quotas.' : '.'}</Note> : null}
+      </> : null}
+      {sec === 'chem' ? <>
+        <div className="small muted mb">{isCil ? 'Stipulated quantity + unit = the import quota checked on every clearance (use “/month” units for monthly quotas).' : 'Chemicals listed on the licence (they print in the PRODUCT INFORMATION table).'}</div>
+        {d.chemicals.map((c, i) => (
+          <div key={i} className="lineitem">
+            <LineHead n={i + 1} onDel={() => delLine(set, 'chemicals', i)} />
+            <Picker label="Trade or IUPAC name" req value={c.name} onChange={setLine(set, 'chemicals', i, 'name')} options={L.chemicals} free title="Chemical" />
+            <div className="grid2"><Text label="EPA registration No." value={c.epaReg} onChange={setLine(set, 'chemicals', i, 'epaReg')} /><Text label="Type" value={c.type} onChange={setLine(set, 'chemicals', i, 'type')} /></div>
+            <div className="grid2"><Num label="Stipulated qty" value={c.qty} onChange={setLine(set, 'chemicals', i, 'qty')} /><Picker label="Unit" value={c.unit} onChange={setLine(set, 'chemicals', i, 'unit')} options={units} free /></div>
+            <Text label="Consignment ref. (BL / IPD No.)" value={c.consignment} onChange={setLine(set, 'chemicals', i, 'consignment')} />
+          </div>))}
+        <Btn kind="line" block icon="plus" onClick={() => addLine(set, 'chemicals', { name: '', epaReg: '', type: '', qty: '', unit: isCil ? 'kg' : '', consignment: '' })}>Add a chemical</Btn>
+      </> : null}
+      {sec === 'veh' ? <>
+        {d.vehicles.map((v, i) => (
+          <div key={i} className="lineitem"><LineHead n={i + 1} onDel={() => delLine(set, 'vehicles', i)}>Vehicle {i + 1}</LineHead>
+            <Text label="Vehicle type" value={v.type} onChange={setLine(set, 'vehicles', i, 'type')} placeholder="e.g. Heavy Duty Truck" />
+            <div className="grid2"><Text label="Registration No." value={v.reg} onChange={setLine(set, 'vehicles', i, 'reg')} /><Text label="EPA registration No." value={v.epaReg} onChange={setLine(set, 'vehicles', i, 'epaReg')} /></div>
+          </div>))}
+        <Btn kind="line" block icon="plus" onClick={() => addLine(set, 'vehicles', { type: 'Heavy Duty Truck', reg: '', epaReg: '' })}>Add a vehicle</Btn>
+      </> : null}
+      {sec === 'eff' ? <>
+        <Card title="Effluent settings">{d.effluent.settings.map((s, i) => <Text key={i} label={s.item || EFF_SETTINGS[i]} value={s.value} onChange={effUpd(set, 'settings', i, 'value')} hint={i === 0 ? 'Used in Conditions 1–2 of the printed EDL, e.g. “the estuary”' : ''} />)}</Card>
+        <div className="sect">Discharge limits (only the parameters this licence needs)</div>
+        {d.effluent.limits.map((l, i) => (
+          <div key={i} className="lineitem"><LineHead n={i + 1} onDel={() => effDel(set, 'limits', i)} />
+            <Picker label="Parameter" req value={l.param} onChange={effUpd(set, 'limits', i, 'param')} options={L.parameters} free />
+            <div className="grid2"><Picker label="Unit" value={l.unit} onChange={effUpd(set, 'limits', i, 'unit')} options={L.effUnits} free /><Text label="Limit" value={l.limit} onChange={effUpd(set, 'limits', i, 'limit')} /></div>
+            <div className="grid2"><Text label="Sample type" value={l.sample} onChange={effUpd(set, 'limits', i, 'sample')} placeholder="Grab / Composite" /><Select label="Testing schedule" value={l.schedule} onChange={effUpd(set, 'limits', i, 'schedule')} options={L.schedules} /></div>
+            {isRp ? <Text label="Discharge stage (retention pond)" value={l.stage} onChange={effUpd(set, 'limits', i, 'stage')} /> : null}
+          </div>))}
+        {d.effluent.limits.length < 20 ? <Btn kind="line" block icon="plus" onClick={() => effAdd(set, 'limits', { param: '', unit: 'mg/L', limit: '', sample: '', schedule: 'Monthly', stage: '' })}>Add a limit</Btn> : null}
+        {isRp ? <>
+          <div className="sect">Geo-reference (Tables 1A / 1B)</div>
+          {d.effluent.coords.map((c, i) => <div key={i} className="lineitem"><LineHead n={i + 1} onDel={() => effDel(set, 'coords', i)} /><div className="grid2"><Select label="Table" value={c.table} onChange={effUpd(set, 'coords', i, 'table')} options={['1A', '1B']} /><Text label="Vertex" value={c.vertex} onChange={effUpd(set, 'coords', i, 'vertex')} /></div>
+            <div className="grid2"><Num label="Easting" value={c.easting} onChange={effUpd(set, 'coords', i, 'easting')} /><Num label="Northing" value={c.northing} onChange={effUpd(set, 'coords', i, 'northing')} /></div></div>)}
+          <Btn kind="line" block icon="pin" onClick={() => effAdd(set, 'coords', { table: '1A', vertex: String.fromCharCode(65 + d.effluent.coords.length), easting: '', northing: '' })}>Add a vertex</Btn>
+          <div className="sect">Discharge sources (Table 1B / 2)</div>
+          {d.effluent.sources.map((s, i) => <div key={i} className="lineitem"><LineHead n={i + 1} onDel={() => effDel(set, 'sources', i)} /><Text label="Discharge source" value={s.source} onChange={effUpd(set, 'sources', i, 'source')} /><Text label="Receiving unit" value={s.unit} onChange={effUpd(set, 'sources', i, 'unit')} />
+            <div className="grid2"><Num label="X" value={s.x} onChange={effUpd(set, 'sources', i, 'x')} /><Num label="Y" value={s.y} onChange={effUpd(set, 'sources', i, 'y')} /></div></div>)}
+          {d.effluent.sources.length < 6 ? <Btn kind="line" block icon="plus" onClick={() => effAdd(set, 'sources', { source: '', unit: '', x: '', y: '' })}>Add a source</Btn> : null}
+        </> : null}
+      </> : null}
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ clearance */
+function ClearanceForm({ d, set }) {
+  const { T, L } = useApp();
+  const co = T.companies.find(c => eqi(c['Company Name'], d.company));
+  const lines = d.lines;
+  const qw = useMemo(() => { try { return co ? quotaWarnings(T, d.company, co['Company ID'], d.date, lines.filter(l => !l.id)) : []; } catch { return []; } }, [T, co, d.company, d.date, lines]);
+  const fee = useMemo(() => feeCalc(lines.filter(l => (trim(l.rec) || trim(l.std)) && trim(l.qty) !== '').map(l => ({ chemical: l.rec || l.std, chemical_standard: l.std && !/other/i.test(l.std) ? l.std : '', quantity: l.qty, unit: l.unit })), T.hazards || [], L.chemicals, L.hazardCats, L.hazardIndex), [lines, T.hazards, L]);
+  const kg = lines.reduce((a, l) => a + num(clrKg(l.qty, l.unit)), 0);
+  const lics = co ? T.licences.filter(l => l['Company ID'] === co['Company ID'] && /CIL|Importation/i.test(l['Licence Category'] + l['Licence / Certificate Type'])) : [];
+  const licChems = co ? [...new Set(T.licenceChemicals.filter(x => lics.some(l => l['Record ID'] === x['Licence Record ID'])).map(x => x['Trade or IUPAC Name']))] : [];
+  return (
+    <>
+      <CompanyPick value={d.company} onChange={upd(set, 'company')} />
+      {co ? <div className="statusline" style={{ marginTop: -6 }}><Icon n="badge" s={14} /> {lics.length ? `${lics.length} importation licence(s): ${lics.map(l => l['Licence / Certificate No.'] || l['Record ID']).join(', ')}` : 'No Chemical Importation Licence on record'}</div> : null}
+      <div className="grid2"><DateIn label="Clearance date" req value={d.date} onChange={upd(set, 'date')} /><DateIn label="ETA" value={d.eta} onChange={upd(set, 'eta')} allowText /></div>
+      <Text label="EPA Ref. No." value={d.ref} onChange={upd(set, 'ref')} hint="EPA letter number, e.g. ED/EPA-01/388/26/RL (needed on the printed letter)" />
+      <Text label="B/L / Invoice / AWB No." value={d.bl} onChange={upd(set, 'bl')} hint="Default for all lines – type a different one on a line if needed" />
+      <Text label="Remarks" value={d.remarks} onChange={upd(set, 'remarks')} hint="Applies to all lines" />
+      <div className="sect">Chemicals ({lines.length}/20)<span className="sp" />{kg ? <span className="nowrap">{money(kg / 1000, 3)} MT</span> : null}</div>
+      {lines.map((l, i) => {
+        const sug = !l.std && trim(l.rec).length > 2 ? stdChem(l.rec, L.chemicals, 2) : [];
+        const hz = lineHazard(l.std, l.qty, l.unit, T.hazards || [], L.hazardCats);
+        return (
+          <div key={i} className="lineitem">
+            <LineHead n={i + 1} onDel={lines.length > 1 ? () => delLine(set, 'lines', i) : null}>{`Line ${i + 1}${l.id ? ' · ' + l.id : ''}`}</LineHead>
+            <Picker label="Chemical as recorded" value={l.rec} onChange={v => set(x => ({ ...x, lines: x.lines.map((y, j) => (j === i ? { ...y, rec: v, std: y.std || (stdChem(v, L.chemicals, 1)[0]?.score >= 0.85 ? stdChem(v, L.chemicals, 1)[0].name : '') } : y)) }))}
+              options={[...licChems, ...L.chemicals].filter((v, k, a) => a.indexOf(v) === k)} free title="Chemical (as written on the document)" />
+            <Picker label="Chemical (standard)" value={l.std} onChange={setLine(set, 'lines', i, 'std')} options={L.chemicals} title="Standard chemical name" />
+            {sug.length ? <div className="chips" style={{ marginTop: -6 }}>{sug.map(s => <button key={s.name} className="chip" onClick={() => setLine(set, 'lines', i, 'std')(s.name)}>✨ {s.name} <span className="n">{Math.round(s.score * 100)}%</span></button>)}</div> : null}
+            <div className="grid2"><Num label="Quantity" req value={l.qty} onChange={setLine(set, 'lines', i, 'qty')} /><Select label="Unit" req value={l.unit} onChange={setLine(set, 'lines', i, 'unit')} options={L.units} /></div>
+            <Text label="B/L / invoice No. (blank = same as above)" value={l.bl} onChange={setLine(set, 'lines', i, 'bl')} />
+            {hz ? <div className="small" style={{ margin: '-4px 2px 8px', color: hz.level === 'bad' ? 'var(--red)' : hz.level === 'warn' ? 'var(--amber)' : 'var(--muted)' }}>⚗ {hz.text}</div> : null}
+          </div>
+        );
+      })}
+      {lines.length < 20 ? <Btn kind="line" block icon="plus" onClick={() => addLine(set, 'lines', { rec: '', std: '', qty: '', unit: 'kg', bl: '' })}>Add a chemical</Btn> : null}
+      {qw.length ? <Note kind="warn"><b>Licence quota check</b><ul>{qw.map((w, i) => <li key={i}>{w}</li>)}</ul></Note> : co && lines.some(l => trim(l.qty)) ? <Note kind="ok">Licence quota check: no problem found.</Note> : null}
+      {fee.lines.length ? <Card title="Fee estimate (RI/C&E-002-04/20)">
+        <div className="flex between"><span className="muted small">Qp = R × Hi × Qi</span><b style={{ fontSize: 18 }}>{fee.total ? usd(fee.total) : '–'}</b></div>
+        {fee.missing ? <div className="small" style={{ color: 'var(--amber)' }}>{fee.missing} line(s) need an HMIS rating / fee category in Chemical Hazards.</div> : null}
+      </Card> : null}
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ bill */
+function BillForm({ d, set, id }) {
+  const { T, D, L } = useApp();
+  const co = T.companies.find(c => eqi(c['Company Name'], d.company));
+  const info = useMemo(() => { if (!co) return null; const bs = D.bills.filter(b => b.coId === co['Company ID'] && b.no !== id); return { n: bs.length, billed: bs.reduce((a, b) => a + b.billed, 0), out: bs.reduce((a, b) => a + (b.isPaid ? 0 : b.out), 0) }; }, [co, D, id]);
+  const svcs = servicesForType(d.type, L.billTypes, L.services);
+  const total = d.lines.reduce((a, l) => a + num(l.amount), 0);
+  const refUsed = trim(d.ref) ? T.bills.find(b => eqi(b['Bill Ref. No.'], d.ref) && b['Bill No.'] !== id) : null;
+  const g = groupOfType(d.type, L.billTypes);
+  const [pickRec, setPickRec] = useState(false);
+  const recs = co ? [...T.licences.filter(l => l['Company ID'] === co['Company ID']).map(l => ({ value: l['Record ID'], label: `${l['Record ID']} – ${l['Licence / Certificate Type'] || l['Licence Category']}`, sub: (l['Licence / Certificate No.'] || 'no licence no.') + (T.bills.some(b => String(b['Linked Record']).includes(l['Record ID'])) ? ' · already billed' : '') })),
+    ...[...new Set(T.clearances.filter(c => c['Company ID'] === co['Company ID']).map(c => c['Clearance No.']))].map(n => ({ value: n, label: n + ' – clearance', sub: T.bills.some(b => String(b['Linked Record']).includes(n)) ? 'already billed' : '' }))] : [];
+  const pickCompany = v => { const c = T.companies.find(x => x['Company Name'] === v); const prev = T.bills.filter(b => eqi(b['Company Name'], v) && b['Contact Person']).sort((a, b) => (toDate(b['Bill Date']) || 0) - (toDate(a['Bill Date']) || 0))[0];
+    set(x => ({ ...x, company: v, location: c ? c['Location'] : x.location, activity: x.activity || (c ? c['Sector / Activity'] : ''), contact: x.contact || (prev ? prev['Contact Person'] : ''), title: x.title || (prev ? prev['Contact Title'] : '') })); };
+  return (
+    <>
+      <CompanyPick value={d.company} onChange={pickCompany} />
+      {info ? <div className="statusline" style={{ marginTop: -6 }}>{co['Company ID']} · {info.n} previous bill(s) · billed {usd(info.billed)} · outstanding {usd(info.out)}</div> : null}
+      <div className="grid2"><DateIn label="Bill date" req value={d.date} onChange={upd(set, 'date')} /><Select label="Bill type" req value={d.type} onChange={upd(set, 'type')} options={L.billTypes.map(b => ({ value: b.type, label: b.type }))} /></div>
+      <Text label="Bill Ref. No." value={d.ref} onChange={upd(set, 'ref')} err={refUsed ? `Already used on ${refUsed['Bill No.']} – each bill needs its own reference` : ''} hint="EPA letter reference, e.g. ED/EPA-01/03336/26/RL" />
+      <div className="grid2"><Text label="Contact person" value={d.contact} onChange={upd(set, 'contact')} placeholder="e.g. Mr. Isaac Bestman" /><Text label="Position / title" value={d.title} onChange={upd(set, 'title')} placeholder="e.g. General Manager" /></div>
+      <div className="grid2"><Text label="Location" value={d.location} onChange={upd(set, 'location')} /><Text label="Activity" value={d.activity} onChange={upd(set, 'activity')} /></div>
+      <Text label="Linked record(s)" value={d.linked} onChange={upd(set, 'linked')} hint="LIC-### / CLN-### – links the bill to the licence or clearance" />
+      <div className="sect">Services ({d.lines.length}/10)<span className="sp" /><span className="nowrap">{usd(total)}</span></div>
+      {d.lines.map((l, i) => {
+        const sg = feeFor(l.service, L.services), lg = l.service ? groupOfType(typeFor(l.service, L.services), L.billTypes) : '';
+        return (
+          <div key={i} className="lineitem">
+            <LineHead n={i + 1} onDel={d.lines.length > 1 ? () => delLine(set, 'lines', i) : null}>{`Line ${i + 1}${l.id ? ' · ' + l.id : ''}`}</LineHead>
+            <Picker label="Service" req value={l.service} onChange={v => set(x => ({ ...x, type: x.type || typeFor(v, L.services), lines: x.lines.map((y, j) => (j === i ? { ...y, service: v, amount: y.amount || (feeFor(v, L.services) ?? '') + '' } : y)) }))}
+              options={svcs.map(s => ({ value: s.service, label: s.service, sub: [s.fee !== null ? 'suggested ' + usd(s.fee) : '', s.notes].filter(Boolean).join(' · ') }))} free warn={g && lg && g !== lg ? `This is a ${lg} service but the bill type is ${g}` : ''} />
+            <Text label="Details / chemical(s)" value={l.details} onChange={setLine(set, 'lines', i, 'details')} />
+            <Num label="Amount (US$)" req value={l.amount} onChange={setLine(set, 'lines', i, 'amount')} hint={sg !== null && num(l.amount) !== sg ? `Suggested fee ${usd(sg)}` : ''} />
+          </div>
+        );
+      })}
+      {d.lines.length < 10 ? <div className="btns"><Btn kind="line" icon="plus" onClick={() => addLine(set, 'lines', { service: '', details: '', amount: '' })}>Add a service</Btn>
+        {co && recs.length ? <Btn kind="line" icon="link" onClick={() => setPickRec(true)}>Add a saved record</Btn> : null}</div> : null}
+      {pickRec ? <PickSheet title="Bill a licence or clearance" opts={recs} onClose={() => setPickRec(false)} onPick={id => { setPickRec(false); const l = billLineFor(T, id, L.services); if (!l) return;
+        const lg = groupOfType(typeFor(l.service, L.services), L.billTypes); if (g && lg && g !== lg) { alertBox({ title: 'Different bill type', message: `${l.service} cannot go on a ${d.type} bill. Save or clear this bill first.` }); return; }
+        set(x => ({ ...x, type: x.type || typeFor(l.service, L.services), linked: x.linked ? x.linked + ', ' + id : id, lines: [...x.lines.filter(y => trim(y.service)), { service: l.service, details: l.details, amount: l.amount === null ? '' : String(l.amount) }] })); }} /> : null}
+      <Card title="Total"><div className="flex between"><span className="muted">US$</span><b style={{ fontSize: 22 }}>{money(total)}</b></div>{total > 0 ? <div className="small muted mt">{amountInWords(total)} UNITED STATES DOLLARS</div> : null}</Card>
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ payment */
+function PaymentForm({ d, set, id }) {
+  const { T, D, L } = useApp();
+  const opts = useMemo(() => [...D.bills].sort((a, b) => (a.isPaid - b.isPaid) || (b.date || 0) - (a.date || 0)).map(b => ({ value: b.no, label: `${b.no} – ${b.co}`, sub: `${b.isPaid ? 'paid' : 'outstanding ' + usd(b.out)} · ${b.type || b.purpose.join(', ')}`, keys: b.ref })), [D]);
+  const st = d.bill ? billStatus(T, d.bill) : null;
+  const own = id ? T.payments.find(p => p['Record ID'] === id) : null;
+  const bal = st ? st.bal + (own && own['Bill No.'] === st.bn ? num(own['Amount (USD)']) : 0) : 0;
+  const recUsed = trim(d.receipt) ? T.payments.find(p => eqi(p['Receipt No.'], d.receipt) && p['Record ID'] !== id) : null;
+  return (
+    <>
+      <Picker label="Bill No. (paying for)" value={d.bill} onChange={v => { const s = billStatus(T, v); set(x => ({ ...x, bill: v, company: v ? s.co : x.company, amount: x.amount || (s.bal ? String(Math.round(s.bal * 100) / 100) : ''), purpose: x.purpose || s.purpose })); }} options={opts} title="Choose the bill"
+        hint={!d.bill ? 'Leave empty for a payment on the company account (not linked to a bill).' : ''} />
+      {!d.bill ? <CompanyPick value={d.company} onChange={upd(set, 'company')} label="Company (payment on the company account)" /> : null}
+      {st && st.co ? <Card><KV items={[['Company', st.co], ['Billed', usd(st.billed)], ['Paid so far', usd(st.paid - (own && own['Bill No.'] === st.bn ? num(own['Amount (USD)']) : 0))], ['Balance', <b key="b">{usd(bal)}</b>], ['For', st.purpose]]} /></Card> : null}
+      <div className="grid2"><Num label="Amount (US$)" req value={d.amount} onChange={upd(set, 'amount')} warn={st && num(d.amount) > bal + 0.005 ? `More than the balance ${usd(bal)}` : ''} /><DateIn label="Payment date" req value={d.date} onChange={upd(set, 'date')} /></div>
+      <Text label="Receipt No." value={d.receipt} onChange={upd(set, 'receipt')} warn={recUsed ? `Already recorded on ${recUsed['Record ID']}` : ''} hint="From the payment slip / receipt" />
+      <Picker label="Purpose / services" req={!d.bill} value={d.purpose} onChange={upd(set, 'purpose')} options={L.purposes} free />
+      <Text label="Remarks" area value={d.remarks} onChange={upd(set, 'remarks')} />
+      {num(d.amount) > 0 ? <div className="small muted">{amountInWords(d.amount)} UNITED STATES DOLLARS</div> : null}
+    </>
+  );
+}
+
+/* ------------------------------------------------------------------ issue, correspondence, inspection, contact, hazard */
+function IssueForm({ d, set }) {
+  const { L } = useApp();
   return (<>
-    <Bar title={edit ? `Edit ${preset.id}` : 'Field inspection'} back={back} onSave={save} busy={F.busy} />
-    <div className="card form">
-      <Field label="Company"><Combo id="cos2" value={F.v.company} onChange={x => F.set('company', x)} options={coNames(snap)} /></Field>
-      <Field label="Site / facility" req err={F.err.site}><input value={F.v.site} onChange={e => F.set('site', e.target.value)} /></Field>
-      <div className="two">
-        <Field label="Date" req err={F.err.date}><input type="date" value={F.v.date} onChange={e => F.set('date', e.target.value)} /></Field>
-        <Field label="Type"><Select value={F.v.type} onChange={x => F.set('type', x)} options={snap.lists.inspectionTypes} /></Field>
-      </div>
-      <Field label="Linked record" hint="Licence, clearance or bill number, if any"><input value={F.v.linked} onChange={e => F.set('linked', e.target.value.toUpperCase())} /></Field>
-      <Field label="Compliance"><Seg value={F.v.compliance} onChange={x => F.set('compliance', x)} options={snap.lists.compliance.map(c => [c, c])} /></Field>
-      <Field label="Findings"><textarea rows={4} value={F.v.findings} onChange={e => F.set('findings', e.target.value)} /></Field>
-      <Field label="Actions required"><textarea rows={3} value={F.v.actions} onChange={e => F.set('actions', e.target.value)} /></Field>
-      <div className="two">
-        <Field label="Follow-up date"><input type="date" value={F.v.followUp} onChange={e => F.set('followUp', e.target.value)} /></Field>
-        <Field label="Inspector"><input value={F.v.inspector} onChange={e => F.set('inspector', e.target.value)} /></Field>
-      </div>
-      <div className="gps"><span>GPS location</span>
-        {F.v.lat ? <b>{F.v.lat}, {F.v.lng} (±{F.v.acc} m)</b> : <small className="muted">not captured</small>}
-        <button type="button" onClick={gps} disabled={gpsBusy}>{gpsBusy ? 'Locating…' : F.v.lat ? 'Capture again' : '📍 Capture GPS'}</button></div>
-      <div className="gps"><span>Photos ({photos.length}{edit ? ' new' : ''})</span>
-        <div className="photos">{photos.map((p, i) => <img key={i} src={`data:image/jpeg;base64,${p.data}`} alt="" onClick={() => confirm('Remove this photo?') && setPhotos(ps => ps.filter((_, j) => j !== i))} />)}</div>
-        {!edit && <button type="button" onClick={photo}>📷 Add photo</button>}</div>
-      <Done busy={F.busy} onSave={save} label={edit ? 'Save changes' : 'Save inspection'} />
-    </div>
+    <Select label="Register" value={d.register} onChange={upd(set, 'register')} options={L.registers.length ? L.registers : ['Companies', 'Licences & Certificates', 'Chemical Clearances', 'Bills & Invoices', 'Payments & Receipts']} />
+    <Text label="Record(s)" value={d.record} onChange={upd(set, 'record')} placeholder="e.g. LIC-029, CLN-141" />
+    <Text label="Issue found" req area value={d.issue} onChange={upd(set, 'issue')} />
+    <Text label="Action taken" area value={d.action} onChange={upd(set, 'action')} />
+    <Select label="Follow-up status" value={d.status} onChange={upd(set, 'status')} options={L.issueStatus} />
+  </>);
+}
+function CorrForm({ d, set }) {
+  const { L } = useApp();
+  return (<>
+    <CompanyPick value={d.company} onChange={upd(set, 'company')} />
+    <Picker label="Type" req value={d.type} onChange={upd(set, 'type')} options={L.corrTypes?.length ? L.corrTypes : ['Reminder Letter', 'Violation Notice', 'Shutdown Notice', 'Other']} free />
+    <Text label="Activity" value={d.activity} onChange={upd(set, 'activity')} placeholder="e.g. Transportation" />
+    <Text label="Description" area value={d.description} onChange={upd(set, 'description')} />
+    <div className="grid2"><Text label="EPA reference No." value={d.ref} onChange={upd(set, 'ref')} /><DateIn label="Date issued" value={d.date} onChange={upd(set, 'date')} /></div>
+  </>);
+}
+const INSP_TYPES = ['Routine inspection', 'Licence application site visit', 'Follow-up inspection', 'Complaint investigation', 'Clearance verification (port)', 'Fumigation check', 'Effluent sampling', 'Chemical storage audit', 'Transport (vehicle) check', 'Emergency / spill response'];
+function InspectionForm({ d, set, photos, setPhotos }) {
+  const { T } = useApp();
+  const [busy, run] = useBusy();
+  const co = T.companies.find(c => eqi(c['Company Name'], d.company));
+  const recs = co ? [...T.licences.filter(l => l['Company ID'] === co['Company ID']).map(l => ({ value: l['Record ID'], label: `${l['Record ID']} – ${l['Licence / Certificate Type'] || l['Licence Category']}` })),
+    ...[...new Set(T.clearances.filter(c => c['Company ID'] === co['Company ID']).map(c => c['Clearance No.']))].map(n => ({ value: n, label: n + ' – clearance' }))] : [];
+  return (<>
+    <CompanyPick value={d.company} onChange={v => { const c = T.companies.find(x => x['Company Name'] === v); set(x => ({ ...x, company: v, site: x.site || (c ? c['Location'] : '') })); }} req={false} free />
+    <Text label="Site / facility" req value={d.site} onChange={upd(set, 'site')} />
+    <div className="grid2"><DateIn label="Inspection date" req value={d.date} onChange={upd(set, 'date')} /><Picker label="Type" value={d.type} onChange={upd(set, 'type')} options={INSP_TYPES} free /></div>
+    {recs.length ? <Picker label="Linked record" value={d.linked} onChange={upd(set, 'linked')} options={recs} free /> : <Text label="Linked record" value={d.linked} onChange={upd(set, 'linked')} />}
+    <div className="field"><label>Compliance</label><Seg value={d.compliance} onChange={upd(set, 'compliance')} options={['Compliant', 'Partly compliant', 'Not compliant', 'Not assessed']} /></div>
+    <Text label="Findings" area value={d.findings} onChange={upd(set, 'findings')} />
+    <Text label="Actions required" area value={d.actions} onChange={upd(set, 'actions')} />
+    <DateIn label="Follow-up date" value={d.followUp} onChange={upd(set, 'followUp')} />
+    <Card title="Location (GPS)">
+      {d.lat !== null && d.lat !== '' && d.lat !== undefined ? <div className="flex between"><span><b>{d.lat}, {d.lng}</b><div className="small muted">± {d.acc} m</div></span><Btn sm kind="ghost" onClick={() => set(x => ({ ...x, lat: null, lng: null, acc: null }))}>Clear</Btn></div> : <div className="small muted mb">Stand at the site and capture the position.</div>}
+      <Btn block kind="line" icon="pin" disabled={busy} onClick={() => run(async () => { const g = await getGps(); set(x => ({ ...x, ...g })); }, 'Position captured')}>{busy ? 'Getting the GPS position…' : 'Capture GPS position'}</Btn>
+    </Card>
+    <Card title={`Photos (${photos.length})`}>
+      <div className="small muted mb">Uploaded to Google Drive (folder “CMU Inspection Photos”) with the inspection.</div>
+      <div className="flex wrap2" style={{ flexWrap: 'wrap' }}>{photos.map((p, i) => <div key={i} style={{ position: 'relative' }}><img src={'data:image/jpeg;base64,' + p.data} alt="" style={{ width: 86, height: 86, objectFit: 'cover', borderRadius: 10 }} /><button className="ib" style={{ position: 'absolute', top: -6, right: -6, width: 28, height: 28, background: 'var(--surface)', borderRadius: 14 }} onClick={() => setPhotos(ps => ps.filter((_, j) => j !== i))}><Icon n="close" s={14} /></button></div>)}</div>
+      <Btn block kind="line" icon="camera" className="mt" onClick={() => run(async () => { const b = await takePhoto('Inspection photo', 1280); if (b) setPhotos(ps => [...ps, { data: b, taken: new Date().toISOString() }]); })}>Add a photo</Btn>
+    </Card>
+  </>);
+}
+function ContactForm({ d, set }) {
+  return (<>
+    <Note>Contact for <b>{d.company}</b> ({d.coId}). Used for the weekly email reminders, calls, WhatsApp and the Gmail email log.</Note>
+    <Text label="Contact person" value={d.person} onChange={upd(set, 'person')} />
+    <Text label="Email (several: separate with ;)" type="email" value={d.email} onChange={upd(set, 'email')} />
+    <Text label="Phone" type="tel" value={d.phone} onChange={upd(set, 'phone')} placeholder="+231 …" />
+    <Toggle label="Send reminders" sub="Weekly email reminders about licences to renew and unpaid bills" value={d.send} onChange={upd(set, 'send')} />
+  </>);
+}
+function HazardForm({ d, set }) {
+  const { L } = useApp();
+  return (<>
+    <Note kind="warn">Take the HMIS ratings from the chemical’s Safety Data Sheet (SDS / MSDS) – never guess them. They drive the fee estimate (Qp = R × Hi × Qi).</Note>
+    <Text label="Chemical (standard)" value={d.name} onChange={upd(set, 'name')} disabled={!!d.name && L.chemicals.includes(d.name)} />
+    <Text label="CAS No." value={d.cas} onChange={upd(set, 'cas')} />
+    <div className="grid3"><Num label="Health" value={d.h} onChange={upd(set, 'h')} /><Num label="Flammability" value={d.f} onChange={upd(set, 'f')} /><Num label="Physical" value={d.p} onChange={upd(set, 'p')} /></div>
+    <Select label="HMIS rating used for the fee (0–4)" value={String(d.hmis)} onChange={upd(set, 'hmis')} options={['0', '1', '2', '3', '4']} hint={d.h !== '' ? `Highest of the three: ${Math.max(num(d.h), num(d.f), num(d.p))}` : ''} />
+    <Select label="Fee category" value={d.cat} onChange={upd(set, 'cat')} options={(L.hazardCats || []).map(c => ({ value: c.name, label: `${c.name} – US$${c.rate} per ${c.basis}` }))} />
+    <Text label="Main hazards / handling notes" area value={d.notes} onChange={upd(set, 'notes')} />
+    <Text label="SDS source & date" value={d.sds} onChange={upd(set, 'sds')} />
   </>);
 }
 
-/* ================================================================ Notes & Issues */
-export function IssueForm({ snap, submit, back, preset = {} }) {
-  const F = useForm({ register: '', record: '', issue: '', action: '', status: 'Open', ...preset });
-  const edit = !!preset.id;
-  const save = async () => {
-    const e = need(F.v, ['issue']); F.setErr(e); if (Object.keys(e).length) return;
-    F.setBusy(true); const ok = await submit('issue', F.v); F.setBusy(false); if (ok) back();
+/* ------------------------------------------------------------------ bill wizard (Bill_New) */
+export function BillWizard({ company }) {
+  const { T, L, D } = useApp(), nav = useNav();
+  const [kind, setKind] = useState(null);
+  const [renew, setRenew] = useState(null);
+  const K = BILL_KINDS.find(k => k.k === kind);
+  const start = (link) => {
+    let lt = K.lt; if (renew && K.renew && !K.renewNoType) lt = 'Licence – Renewal';
+    if (link) return nav.replace('form', { type: 'bill', op: 'create', fromIds: [link], prefill: { type: lt } });
+    const lines = K.svc.map((s, i) => ({ service: s, details: i === 0 && K.details ? K.details : '', amount: (feeFor(s, L.services) ?? '') + '' }));
+    nav.replace('form', { type: 'bill', op: 'create', prefill: { type: lt, lines, company: company || '' } });
   };
-  return (<>
-    <Bar title={edit ? `Edit ${preset.id}` : 'Report a data issue'} back={back} onSave={save} busy={F.busy} />
-    <div className="card form">
-      <Field label="Register"><Select value={F.v.register} onChange={x => F.set('register', x)} options={snap.lists.registers} /></Field>
-      <Field label="Record" hint="ID of the record, e.g. LIC-067"><input value={F.v.record} onChange={e => F.set('record', e.target.value.toUpperCase())} /></Field>
-      <Field label="Issue found" req err={F.err.issue}><textarea rows={4} value={F.v.issue} onChange={e => F.set('issue', e.target.value)} /></Field>
-      <Field label="Action taken"><textarea rows={2} value={F.v.action} onChange={e => F.set('action', e.target.value)} /></Field>
-      <Field label="Follow-up status"><Combo id="ist" value={F.v.status} onChange={x => F.set('status', x)} options={snap.lists.issueStatus} /></Field>
-      <Done busy={F.busy} onSave={save} label={edit ? 'Save changes' : 'Save'} />
-    </div>
-  </>);
+  const linkable = K && K.link === 'LIC' ? T.licences.filter(l => (!company || eqi(l['Company Name'], company)) && svcFor(l['Licence Category'], l['Licence / Certificate Type']) === K.svc[0])
+    .sort((a, b) => String(b['Record ID']).localeCompare(String(a['Record ID']))).map(l => ({ id: l['Record ID'], t1: l['Company Name'], t2: `${l['Record ID']} · ${l['Licence / Certificate No.'] || 'no licence no.'}`, billed: T.bills.some(b => String(b['Linked Record']).includes(l['Record ID'])) }))
+    : K && K.link === 'CLN' ? [...new Set(T.clearances.filter(c => !company || eqi(c['Company Name'], company)).map(c => c['Clearance No.']))].sort().reverse().map(n => { const c = T.clearances.find(x => x['Clearance No.'] === n); return { id: n, t1: c['Company Name'], t2: `${n} · ${fmtD(c['Clearance Date'])}`, billed: T.bills.some(b => String(b['Linked Record']).includes(n)) }; }) : [];
+  const step = !K ? 1 : K.renew && renew === null ? 2 : 3;
+  return (
+    <>
+      <Bar title="Create new bill" sub={`Step ${step} of 3${company ? ' · ' + company : ''}`} onBack={() => (step === 1 ? nav.back() : step === 2 ? setKind(null) : K.renew ? setRenew(null) : setKind(null))} />
+      <main className="main noNav"><div className="wrap">
+        {step === 1 ? <><div className="sect">What kind of bill?</div><div className="list">{BILL_KINDS.map(k => <Row key={k.k} icon={k.link === 'CLN' ? 'flask' : k.k === 6 ? 'drop' : k.k === 8 ? 'truck' : k.k === 9 ? 'flag' : 'badge'} t1={k.label} t2={k.svc.map(s => s + (feeFor(s, L.services) !== null ? ` (${usd(feeFor(s, L.services))})` : '')).join(' + ')} onClick={() => setKind(k.k)} />)}</div></> : null}
+        {step === 2 ? <><div className="sect">{K.label}</div><div className="list"><Row icon="refresh" t1="Renewal" t2={K.renewNoType ? 'Renewal of the licence' : 'Renewal letter (Licence – Renewal)'} onClick={() => setRenew(true)} /><Row icon="plus" t1="New application" t2="New application letter" onClick={() => setRenew(false)} /></div></> : null}
+        {step === 3 ? <>
+          <div className="sect">{K.label}{renew ? ' – renewal' : ''}</div>
+          {K.link ? <><div className="small muted mb">Optional: link the saved {K.link === 'CLN' ? 'clearance' : 'licence'} – the company, service, details and fee are filled in, and the record is marked as billed.</div>
+            <div className="list" style={{ maxHeight: '50vh', overflowY: 'auto' }}>{linkable.slice(0, 80).map(x => <Row key={x.id} icon={K.link === 'CLN' ? 'flask' : 'badge'} t1={x.t1} t2={x.t2} right={x.billed ? <Badge tone="amber">billed</Badge> : ''} onClick={() => start(x.id)} />)}
+              {!linkable.length ? <div className="empty small">No matching saved record.</div> : null}</div></> : null}
+          <Btn block kind={K.link ? 'line' : 'accent'} icon="chev" onClick={() => start(null)}>{K.link ? 'Continue without a link' : 'Continue'}</Btn>
+        </> : null}
+      </div></main>
+    </>
+  );
 }
-
-/* ================================================================ Correspondence (reminder letters, violation / shutdown notices) */
-export function CorrespondenceForm({ snap, submit, back, preset = {} }) {
-  const F = useForm({ company: '', type: '', activity: '', description: '', ref: '', date: today(), ...preset });
-  const edit = !!preset.id;
-  const save = async () => {
-    const e = need(F.v, ['type', 'description']); F.setErr(e); if (Object.keys(e).length) return;
-    F.setBusy(true); const ok = await submit('correspondence', { ...F.v, company: coFix(snap, F.v.company) }); F.setBusy(false); if (ok) back();
-  };
-  return (<>
-    <Bar title={edit ? `Edit ${preset.id}` : 'Correspondence'} sub="Letters and notices to companies" back={back} onSave={save} busy={F.busy} />
-    <div className="card form">
-      <Field label="Company"><Combo id="corco" value={F.v.company} onChange={x => { F.set('company', x); const r = snap.tables.companies.find(q => eq(q['Company Name'], x)); if (r && !F.v.activity) F.set('activity', r['Sector / Activity'] || ''); }} options={coNames(snap)} /></Field>
-      <div className="two">
-        <Field label="Type" req err={F.err.type}><Combo id="cort" value={F.v.type} onChange={x => F.set('type', x)} options={snap.lists.corTypes} /></Field>
-        <Field label="Date"><input type="date" value={F.v.date} onChange={e => F.set('date', e.target.value)} /></Field>
-      </div>
-      <Field label="Activity"><input value={F.v.activity} onChange={e => F.set('activity', e.target.value)} /></Field>
-      <Field label="Description" req err={F.err.description}><textarea rows={4} value={F.v.description} onChange={e => F.set('description', e.target.value)} /></Field>
-      <Field label="EPA reference No."><input value={F.v.ref} onChange={e => F.set('ref', e.target.value)} /></Field>
-      <Done busy={F.busy} onSave={save} label={edit ? 'Save changes' : 'Save'} />
-    </div>
-  </>);
-}
-
-/* ================================================================ Add a chemical to the standard list (and its HMIS rating / fee category) */
-export function ChemicalForm({ snap, submit, back, preset = {} }) {
-  const F = useForm({ name: '', cas: '', hmis: '', cat: '', notes: '', ...preset });
-  const list = snap.lists.chemicals || [];
-  const exact = list.find(c => eq(c, F.v.name));
-  const near = F.v.name.trim().length >= 4 && !exact ? suggestChem(list, F.v.name, 3).filter(x => x.score >= 0.7) : [];
-  const save = async () => {
-    const e = need(F.v, ['name']); F.setErr(e); if (Object.keys(e).length) return;
-    F.setBusy(true); const ok = await submit('chemical', F.v); F.setBusy(false); if (ok) back();
-  };
-  return (<>
-    <Bar title="Add a chemical" sub="To the standard chemical list (drop-downs) and Chemical Hazards" back={back} onSave={save} busy={F.busy} />
-    <div className="card form">
-      <Field label="Chemical name (standard)" req err={F.err.name} hint="As it should appear in every drop-down, e.g. Sodium Bicarbonate"><input value={F.v.name} onChange={e => F.set('name', e.target.value)} /></Field>
-      {exact && <p className="infobox">“{exact}” is already on the list – saving only adds the hazard details below.</p>}
-      {near.length > 0 && <p className="warnbox">Similar names already on the list: {near.map(x => x.name).join(', ')}. Use one of them if it is the same chemical.</p>}
-      <Field label="CAS No."><input value={F.v.cas} onChange={e => F.set('cas', e.target.value)} placeholder="e.g. 144-55-8" /></Field>
-      <div className="two">
-        <Field label="HMIS rating for the fee (0–4)" hint="From the Safety Data Sheet – never guessed"><Select value={String(F.v.hmis)} onChange={x => F.set('hmis', x)} options={['0', '1', '2', '3', '4']} /></Field>
-        <Field label="Fee category"><Select value={F.v.cat} onChange={x => F.set('cat', x)} options={(snap.hazards.cats || []).map(c => c[0])} /></Field>
-      </div>
-      <Field label="Hazards / handling notes"><textarea rows={2} value={F.v.notes} onChange={e => F.set('notes', e.target.value)} /></Field>
-      <Done busy={F.busy} onSave={save} label="Add to the chemical list" />
-    </div>
-  </>);
-}
-/** shown under a chemical field when the name typed is not on the list */
-export function AddChem({ name, snap, go }) {
-  const n = String(name || '').trim();
-  if (n.length < 3 || (snap.lists.chemicals || []).some(c => eq(c, n)) || !go) return null;
-  return <button type="button" className="link left" onClick={() => go('form', { form: 'chemical', preset: { name: n } })}>➕ “{n}” is not on the chemical list – add it</button>;
-}
-
-export const FORMS = { company: CompanyForm, licence: LicenceForm, clearance: ClearanceForm, bill: BillForm, payment: PaymentForm, inspection: InspectionForm, issue: IssueForm, correspondence: CorrespondenceForm, chemical: ChemicalForm };
-export const FORM_LABEL = { company: 'Company', licence: 'Licence', clearance: 'Clearance', bill: 'Bill', payment: 'Payment', inspection: 'Inspection', issue: 'Data issue', correspondence: 'Correspondence', chemical: 'Chemical', delete: 'Delete', inboxReject: 'Document rejected' };
-export { addDays };
